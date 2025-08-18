@@ -19,17 +19,47 @@ def load_encoder(model_name: str):
     return SentenceTransformer(model_name, trust_remote_code=True)
 
 def embed_texts(encoder, texts: List[str], batch_size: int = 64) -> np.ndarray:
-    vecs = []
-    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
+    """
+    Embebe garantizando que todo sea str y normalizando embeddings.
+    Evita TypeError: TextEncodeInput...
+    """
+    vecs: List[np.ndarray] = []
+    # dimensión segura si la necesitamos (ST>=3 expone este método)
+    dim = getattr(encoder, "get_sentence_embedding_dimension", lambda: 768)()
+
+    n = len(texts)
+    for i in tqdm(range(0, n, batch_size), desc="Embedding"):
+        batch = texts[i:i + batch_size]
+
+        # --- sanitizar entradas a str ---
+        clean: List[str] = []
+        for t in batch:
+            if t is None:
+                clean.append("")
+            elif isinstance(t, str):
+                clean.append(t)
+            elif isinstance(t, bytes):
+                clean.append(t.decode("utf-8", errors="ignore"))
+            else:
+                clean.append(str(t))
+
+        if not clean:
+            continue
+
         part = encoder.encode(
-            texts[i:i+batch_size],
-            batch_size=batch_size,
+            clean,
+            batch_size=min(batch_size, len(clean)),
             normalize_embeddings=True,
             convert_to_numpy=True,
-            show_progress_bar=False
+            show_progress_bar=False,
         )
-        vecs.append(part.astype("float32"))
-    return np.vstack(vecs) if vecs else np.zeros((0, 384), dtype="float32")
+        part = np.asarray(part, dtype="float32")
+        vecs.append(part)
+
+    if not vecs:
+        return np.zeros((0, int(dim)), dtype="float32")
+    return np.vstack(vecs)
+
 
 # ---------- IO JSONL ----------
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -51,22 +81,52 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 # ---------- Indexado ----------
-def build_index(corpus_path: Path, out_dir: Path, embed_model: str):
+def build_index(corpus_path: Path, out_dir: Path, embed_model: str) -> None:
+    """
+    Construye un índice FAISS (coseno vía IP con embeddings normalizados) a partir de _corpus_segments.jsonl.
+
+    Entradas:
+      - corpus_path: ruta al JSONL global agregado por el pipeline de transcripción.
+      - out_dir: carpeta donde se guardarán index.faiss, meta.jsonl y encoder.json
+      - embed_model: nombre del modelo de sentence-transformers (p.ej. 'intfloat/multilingual-e5-base').
+
+    Salidas (en out_dir):
+      - index.faiss   : índice vectorial FAISS (IndexFlatIP).
+      - meta.jsonl    : metadatos por segmento (sin embeddings).
+      - encoder.json  : información del encoder (modelo, dimensión, cantidad, flags).
+    """
+    import time
+    import numpy as np
+    import faiss
+
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"Corpus no encontrado: {corpus_path}")
+
     data = read_jsonl(corpus_path)
     if not data:
-        console.print("[red]Corpus vacío o ilegible[/red]")
-        sys.exit(1)
+        raise ValueError(f"Corpus vacío o ilegible: {corpus_path}")
 
-    # Texto base por segmento (incluye rol si existe)
-    texts = []
-    metas = []
+    # Detectar si es un encoder tipo E5 para aplicar prefijos recomendados
+    is_e5 = "e5" in (embed_model or "").lower()
+
+    texts: List[str] = []
+    metas: List[Dict[str, Any]] = []
+
+    # Construcción de textos y metadatos
     for i, r in enumerate(data):
-        spk = r.get("speaker")
         seg_txt = (r.get("text") or "").strip()
-        base = f"[{spk}] {seg_txt}" if spk else seg_txt
-        # Puedes añadir más señales: carpeta, nombre de video, etc.
-        texts.append(base)
+        if not seg_txt:
+            continue  # omitir segmentos vacíos
+
+        spk = r.get("speaker")
+        base_text = f"[{spk}] {seg_txt}" if spk else seg_txt
+        # Prefijo para E5 (mejora recall en recuperación densa)
+        if is_e5:
+            base_text = f"passage: {base_text}"
+
+        texts.append(base_text)
         metas.append({
             "id": i,
             "video_relpath": r.get("video_relpath"),
@@ -78,21 +138,39 @@ def build_index(corpus_path: Path, out_dir: Path, embed_model: str):
             "text": seg_txt
         })
 
+    if not texts:
+        raise ValueError("No se encontraron segmentos no vacíos para indexar.")
+
+    # Cargar encoder y generar embeddings normalizados
     encoder = load_encoder(embed_model)
-    vecs = embed_texts(encoder, texts)
-    d = vecs.shape[1]
-    index = faiss.IndexFlatIP(d)  # IP con vectores normalizados = coseno
+    vecs = embed_texts(encoder, texts)  # np.ndarray [N, d] float32 normalizado
+
+    if vecs.ndim != 2 or vecs.shape[0] != len(metas):
+        raise RuntimeError("Dimensiones de embeddings no coinciden con metadatos.")
+
+    d = int(vecs.shape[1])
+
+    # Índice FAISS: IP con embeddings normalizados => coseno
+    index = faiss.IndexFlatIP(d)
     index.add(vecs)
 
+    # Guardar índice y metadatos
     faiss.write_index(index, str(out_dir / "index.faiss"))
     write_jsonl(out_dir / "meta.jsonl", metas)
-    (out_dir / "encoder.json").write_text(json.dumps({
-        "model": embed_model,
-        "dim": int(d),
-        "count": len(metas)
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    console.print(f"[green]OK[/green] Index guardado en: {out_dir}")
+    encoder_info = {
+        "model": embed_model,
+        "dim": d,
+        "count": int(index.ntotal),
+        "normalized": True,
+        "is_e5": bool(is_e5),
+        "created_at": int(time.time())
+    }
+    (out_dir / "encoder.json").write_text(
+        json.dumps(encoder_info, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
 
 def mmr_from_index(index, query_vec: np.ndarray, candidate_ids: List[int], topn: int, lambda_: float = 0.5):
     """
@@ -137,6 +215,37 @@ def load_index(index_dir: Path):
     meta = read_jsonl(index_dir / "meta.jsonl")
     enc_info = json.loads((index_dir / "encoder.json").read_text(encoding="utf-8"))
     return index, meta, enc_info
+
+def expand_context(meta, seed_rows, window_s: float, max_total: int = 60):
+    """
+    Dado un conjunto de filas meta 'semilla' (los hits), agrega vecinos por (mismo video)
+    cuya ventana de tiempo caiga dentro de [start-window_s, end+window_s].
+    Limita el total de segmentos para no desbordar el prompt.
+    """
+    selected = {(r["video_relpath"], r["start"], r["end"]) for r in seed_rows}
+    out = list(seed_rows)
+    for r in seed_rows:
+        vrel, a, b = r["video_relpath"], float(r["start"]), float(r["end"])
+        lo, hi = a - window_s, b + window_s
+        # barrido simple (corpus típico no tiene millones de segmentos)
+        for m in meta:
+            if m["video_relpath"] != vrel:
+                continue
+            s, e = float(m["start"]), float(m["end"])
+            if (vrel, s, e) in selected:
+                continue
+            if (s >= lo and s <= hi) or (e >= lo and e <= hi):
+                out.append(m)
+                selected.add((vrel, s, e))
+                if len(out) >= max_total:
+                    return sorted(out, key=lambda x: (x["folder"], x["video_name"], x["start"]))
+    return sorted(out, key=lambda x: (x["folder"], x["video_name"], x["start"]))
+
+def filter_candidates_by_person(candidates_ids, meta, person: str):
+    if not person:
+        return candidates_ids
+    return [i for i in candidates_ids if (meta[i].get("folder") or "").lower() == person.lower()]
+
 
 # ---------- LLM (Ollama) ----------
 def ollama_chat(model: str, system_prompt: str, user_prompt: str, base_url: str = "http://localhost:11434"):
@@ -185,9 +294,11 @@ def format_context(rows: List[Dict[str, Any]]) -> str:
 
 def make_system_prompt(locale: str) -> str:
     return (
-        "Eres un asistente que responde únicamente con base en el CONTEXTO dado. "
-        "Si la pregunta no está cubierta por el contexto, responde exactamente: 'No sé'. "
-        "No inventes información. Responde en español, registro neutro de Colombia."
+        "Eres un asistente que responde ÚNICAMENTE con base en el CONTEXTO proporcionado. "
+        "Tu tarea es integrar y sintetizar ideas de múltiples fragmentos para responder de forma clara. "
+        "Si el contexto no contiene la respuesta, escribe exactamente: 'No sé'. "
+        "No inventes datos. No listes fuentes a menos que te lo pidan explícitamente. "
+        "Responde en español, registro neutro de Colombia."
     )
 
 def make_user_prompt(question: str, context: str) -> str:
@@ -199,6 +310,17 @@ def make_user_prompt(question: str, context: str) -> str:
     )
 
 # ---------- CLI ----------
+def print_sources(rows, max_sources: int, show: bool):
+    if not show:
+        return
+    from itertools import islice
+    print("\nFuentes:")
+    for r in islice(rows, max_sources):
+        t0 = seconds_to_hhmmss(r["start"]); t1 = seconds_to_hhmmss(r["end"])
+        who = r.get("speaker") or "DESCONOCIDO"
+        print(f" - {r['folder']}/{r['video_name']} {t0}-{t1} [{who}]")
+
+
 def cmd_index(args):
     build_index(Path(args.corpus), Path(args.out), args.embed_model)
     if args.show_stats:
@@ -210,11 +332,13 @@ def cmd_index(args):
 
 def cmd_chat(args):
     """
-    Inicia el chat RAG local:
-    - Búsqueda en FAISS (IndexFlatIP con embeddings normalizados)
-    - MMR para diversidad con reconstrucción de candidatos
-    - Gating por umbrales (top-1 y media top-3)
-    - Llamada a Ollama vía /api/generate (0.11.x)
+    Chat RAG local, cerrado al corpus:
+    - Búsqueda en FAISS (coseno con embeddings normalizados)
+    - Filtro opcional por persona (--person)
+    - MMR para diversidad
+    - Ventanas alrededor de hits (--window-s) para coherencia
+    - Gating por umbrales
+    - LLM local vía /api/generate (Ollama 0.11.x)
     """
     index, meta, enc_info = load_index(Path(args.index))
     encoder = load_encoder(enc_info["model"])
@@ -226,53 +350,60 @@ def cmd_chat(args):
             if not q:
                 continue
 
-            # 1) Embeddings de la consulta
-            q_vec = embed_texts(encoder, [q])  # (1, d)
+            # Prefijo E5 para consultas (mejora recall)
+            q_input = q
+            enc_name = (enc_info.get("model") or "").lower()
+            if "e5" in enc_name and not q.lower().startswith("query:"):
+                q_input = f"query: {q}"
 
-            # 2) Búsqueda inicial para candidatos
-            fetch_k = min(args.k * 6, 100)
+            # 1) Embedding de la consulta
+            q_vec = embed_texts(encoder, [q_input])  # (1,d)
+
+            # 2) Candidatos (fetch_k > k)
+            fetch_k = min(args.k * 6, 150)
             D, I = index.search(q_vec, fetch_k)
             candidates = [int(i) for i in I[0].tolist() if i != -1]
+
+            # 2b) Filtro por persona (carpeta), si aplica
+            candidates = filter_candidates_by_person(candidates, meta, args.person)
             if not candidates:
                 console.print("[yellow]No sé[/yellow]")
                 continue
 
-            # 3) MMR con reconstrucción de vectores de los candidatos
+            # 3) MMR con reconstrucción de candidatos
             picked, sims_map = mmr_from_index(index, q_vec[0], candidates, topn=args.k, lambda_=0.5)
 
-            # 4) Gating por similitud (coseno)
+            # 4) Gating
             top_scores = sorted([float(sims_map[i]) for i in picked], reverse=True)
             top1 = top_scores[0] if top_scores else 0.0
             top3mean = float(np.mean(top_scores[:3])) if top_scores else 0.0
-
             if (top1 < args.threshold_top) or (top3mean < args.threshold_mean):
                 console.print("[yellow]No sé[/yellow]")
                 continue
 
-            # 5) Construcción de contexto y prompt
-            ctx_rows = [meta[i] for i in picked]
+            # 5) Expansión de contexto con ventanas por video
+            seed_rows = [meta[i] for i in picked]
+            ctx_rows = expand_context(meta, seed_rows, window_s=args.window_s, max_total=max(args.k*5, 60))
+
+            # 6) Construcción de prompts y llamada a LLM
             ctx = format_context(ctx_rows)
             sys_prompt = make_system_prompt(args.locale)
             user_prompt = make_user_prompt(q, ctx)
-
-            # 6) LLM local (Ollama /api/generate)
             try:
                 ans = ollama_chat(args.model, sys_prompt, user_prompt, base_url=args.ollama_url)
             except Exception as e:
-                console.print(f"[red]Error al llamar a Ollama:[/red] {e}")
+                console.print(f"[red]Error Ollama:[/red] {e}")
                 continue
 
-            # 7) Respuesta y fuentes
-            console.print(f"[green]Asistente[/green]: {ans}\n")
-            console.print("[dim]Fuentes:[/dim]")
-            for pid, r in zip(picked, ctx_rows):
-                t0 = seconds_to_hhmmss(r["start"]); t1 = seconds_to_hhmmss(r["end"])
-                who = r.get("speaker") or "DESCONOCIDO"
-                console.print(f" - {r['folder']}/{r['video_name']} {t0}-{t1} [{who}]")
+            # 7) Salida
+            console.print(f"[green]Asistente[/green]: {ans}")
+            print_sources(ctx_rows, max_sources=args.max_sources, show=args.show_sources)
+            print()
 
         except KeyboardInterrupt:
             console.print("\n[red]Fin[/red]")
             break
+
 
 
 def main():
@@ -288,12 +419,16 @@ def main():
 
     c = sp.add_parser("chat", help="Inicia el chat local con Ollama (cerrado al corpus)")
     c.add_argument("--model", default="llama3.1:8b", help="Modelo de Ollama")
-    c.add_argument("--index", default="index", help="Carpeta donde está el índice")
-    c.add_argument("--k", type=int, default=8, help="Nº de segmentos a usar como contexto")
-    c.add_argument("--threshold-top", type=float, default=0.35, help="Mínimo coseno top-1")
-    c.add_argument("--threshold-mean", type=float, default=0.33, help="Mínimo media top-3")
+    c.add_argument("--index", default="index", help="Carpeta donde está el índice")    
     c.add_argument("--locale", default="es-CO", help="Variante regional para el estilo de respuesta")
     c.add_argument("--ollama-url", default="http://localhost:11434", help="URL del servidor de Ollama")
+    c.add_argument("--show-sources", action="store_true", help="Muestra/oculta la lista de fuentes en consola.")
+    c.add_argument("--max-sources", type=int, default=4, help="Máximo de fuentes a mostrar si --show-sources.")
+    c.add_argument("--window-s", type=float, default=8.0, help="Ventana (s) para expandir contexto alrededor de cada hit.")
+    c.add_argument("--person", type=str, default=None, help="Filtra por carpeta/persona (ej. 'Alejo').")
+    c.add_argument("--k", type=int, default=12, help="Segmentos base a usar (sube para más contexto agregado).")
+    c.add_argument("--threshold-top", type=float, default=0.30, help="Mínimo coseno top-1 (bajar si dice 'No sé' muy seguido).")
+    c.add_argument("--threshold-mean", type=float, default=0.28, help="Mínimo media top-3.")
     c.set_defaults(func=cmd_chat)
 
     args = ap.parse_args()
