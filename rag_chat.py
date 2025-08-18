@@ -94,26 +94,43 @@ def build_index(corpus_path: Path, out_dir: Path, embed_model: str):
 
     console.print(f"[green]OK[/green] Index guardado en: {out_dir}")
 
-def mmr(query_vec: np.ndarray, doc_vecs: np.ndarray, topn: int, fetch_k: int = 50, lambda_: float = 0.5):
-    # Devuelve índices MMR (diversidad) a partir de similitudes
-    sims = (doc_vecs @ query_vec.reshape(-1,1)).ravel()
-    candidates = sims.argsort()[::-1][:fetch_k].tolist()
+def mmr_from_index(index, query_vec: np.ndarray, candidate_ids: List[int], topn: int, lambda_: float = 0.5):
+    """
+    MMR usando únicamente los vectores de los candidatos (reconstruidos desde el índice).
+    Requiere que los embeddings almacenados estén normalizados (lo están si usaste SentenceTransformers con normalize_embeddings=True).
+    """
+    # reconstruye los vectores de los candidatos
+    cand_vecs = []
+    for cid in candidate_ids:
+        v = np.asarray(index.reconstruct(int(cid)), dtype="float32")
+        cand_vecs.append(v)
+    cand_vecs = np.vstack(cand_vecs) if cand_vecs else np.zeros((0, query_vec.shape[0]), dtype="float32")
+
+    # similitud con la query (IP == coseno si todo normalizado)
+    sims = (cand_vecs @ query_vec.reshape(-1, 1)).ravel()
+    order = sims.argsort()[::-1].tolist()  # candidatos ordenados por similitud desc
+
     selected = []
-    while candidates and len(selected) < topn:
+    while order and len(selected) < topn:
         if not selected:
-            selected.append(candidates.pop(0))
+            selected.append(order.pop(0))
             continue
-        # Penalizar por similitud con lo ya elegido
-        mmr_scores = []
-        for c in candidates:
-            sim_to_query = sims[c]
-            sim_to_selected = max((doc_vecs[c] @ doc_vecs[s]) for s in selected)
-            score = lambda_ * sim_to_query - (1 - lambda_) * sim_to_selected
-            mmr_scores.append((score, c))
-        mmr_scores.sort(key=lambda x: x[0], reverse=True)
-        selected.append(mmr_scores[0][1])
-        candidates.remove(mmr_scores[0][1])
-    return selected, sims
+        best_j = None
+        best_score = -1e9
+        for j in order:
+            sim_q = sims[j]
+            # penalización por similitud con lo ya seleccionado
+            sim_sel = max(float(cand_vecs[j] @ cand_vecs[s]) for s in selected)
+            score = lambda_ * sim_q - (1.0 - lambda_) * sim_sel
+            if score > best_score:
+                best_score, best_j = score, j
+        selected.append(best_j)
+        order.remove(best_j)
+
+    # devolver ids de índice global correspondientes y un mapa de similitudes
+    picked_ids = [int(candidate_ids[j]) for j in selected]
+    sim_map = {int(candidate_ids[j]): float(sims[j]) for j in range(len(candidate_ids))}
+    return picked_ids, sim_map
 
 def load_index(index_dir: Path):
     index = faiss.read_index(str(index_dir / "index.faiss"))
@@ -123,23 +140,31 @@ def load_index(index_dir: Path):
 
 # ---------- LLM (Ollama) ----------
 def ollama_chat(model: str, system_prompt: str, user_prompt: str, base_url: str = "http://localhost:11434"):
-    url = f"{base_url}/api/chat"
+    """
+    Implementación fija para Ollama 0.11.x usando únicamente /api/generate.
+    Combina system + user en un único prompt.
+    """
+    import requests
+
+    url_gen = f"{base_url}/api/generate"
+    prompt = (
+        f"<<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
+        f"{user_prompt}"
+    )
     payload = {
         "model": model,
-        "messages": [
-            {"role":"system","content":system_prompt},
-            {"role":"user","content":user_prompt}
-        ],
+        "prompt": prompt,
         "options": {
             "temperature": 0.1,
-            "num_ctx": 4096
+            "num_ctx": 4096,
+            "num_predict": 512
         },
         "stream": False
     }
-    r = requests.post(url, json=payload, timeout=600)
+    r = requests.post(url_gen, json=payload, timeout=600)
     r.raise_for_status()
     data = r.json()
-    return data.get("message", {}).get("content", "").strip()
+    return (data.get("response") or "").strip()
 
 def seconds_to_hhmmss(x: float) -> str:
     x = max(0.0, float(x))
@@ -184,6 +209,13 @@ def cmd_index(args):
         console.print(table)
 
 def cmd_chat(args):
+    """
+    Inicia el chat RAG local:
+    - Búsqueda en FAISS (IndexFlatIP con embeddings normalizados)
+    - MMR para diversidad con reconstrucción de candidatos
+    - Gating por umbrales (top-1 y media top-3)
+    - Llamada a Ollama vía /api/generate (0.11.x)
+    """
     index, meta, enc_info = load_index(Path(args.index))
     encoder = load_encoder(enc_info["model"])
 
@@ -194,20 +226,22 @@ def cmd_chat(args):
             if not q:
                 continue
 
-            q_vec = embed_texts(encoder, [q])
-            # búsqueda bruta (IP); FAISS retorna índices y distancias
-            D, I = index.search(q_vec, min(args.k * 3, 50))
-            # MMR para diversidad
-            idx_mmr, sims = mmr(q_vec[0], index.reconstruct_n(0, index.ntotal), args.k, fetch_k=min(args.k*6, 100), lambda_=0.5)
-            # combinar top por similitud y MMR (simple unión priorizando MMR)
-            picked = []
-            for i in idx_mmr:
-                if i not in picked:
-                    picked.append(i)
-                if len(picked) >= args.k:
-                    break
+            # 1) Embeddings de la consulta
+            q_vec = embed_texts(encoder, [q])  # (1, d)
 
-            top_scores = sorted([float(sims[i]) for i in picked], reverse=True)
+            # 2) Búsqueda inicial para candidatos
+            fetch_k = min(args.k * 6, 100)
+            D, I = index.search(q_vec, fetch_k)
+            candidates = [int(i) for i in I[0].tolist() if i != -1]
+            if not candidates:
+                console.print("[yellow]No sé[/yellow]")
+                continue
+
+            # 3) MMR con reconstrucción de vectores de los candidatos
+            picked, sims_map = mmr_from_index(index, q_vec[0], candidates, topn=args.k, lambda_=0.5)
+
+            # 4) Gating por similitud (coseno)
+            top_scores = sorted([float(sims_map[i]) for i in picked], reverse=True)
             top1 = top_scores[0] if top_scores else 0.0
             top3mean = float(np.mean(top_scores[:3])) if top_scores else 0.0
 
@@ -215,22 +249,31 @@ def cmd_chat(args):
                 console.print("[yellow]No sé[/yellow]")
                 continue
 
+            # 5) Construcción de contexto y prompt
             ctx_rows = [meta[i] for i in picked]
             ctx = format_context(ctx_rows)
             sys_prompt = make_system_prompt(args.locale)
             user_prompt = make_user_prompt(q, ctx)
-            ans = ollama_chat(args.model, sys_prompt, user_prompt, base_url=args.ollama_url)
 
-            # Mostrar respuesta + fuentes
+            # 6) LLM local (Ollama /api/generate)
+            try:
+                ans = ollama_chat(args.model, sys_prompt, user_prompt, base_url=args.ollama_url)
+            except Exception as e:
+                console.print(f"[red]Error al llamar a Ollama:[/red] {e}")
+                continue
+
+            # 7) Respuesta y fuentes
             console.print(f"[green]Asistente[/green]: {ans}\n")
             console.print("[dim]Fuentes:[/dim]")
-            for r in ctx_rows:
+            for pid, r in zip(picked, ctx_rows):
                 t0 = seconds_to_hhmmss(r["start"]); t1 = seconds_to_hhmmss(r["end"])
-                console.print(f" - {r['folder']}/{r['video_name']} {t0}-{t1} [{r.get('speaker') or 'DESCONOCIDO'}]")
+                who = r.get("speaker") or "DESCONOCIDO"
+                console.print(f" - {r['folder']}/{r['video_name']} {t0}-{t1} [{who}]")
 
         except KeyboardInterrupt:
             console.print("\n[red]Fin[/red]")
             break
+
 
 def main():
     ap = argparse.ArgumentParser(description="RAG local sobre entrevistas: index y chat (cerrado al corpus).")
