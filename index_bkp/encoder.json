@@ -1,8 +1,8 @@
 {
   "model": "intfloat/multilingual-e5-base",
   "dim": 768,
-  "count": 1090,
+  "count": 241,
   "normalized": true,
   "is_e5": true,
-  "created_at": 1755631350
+  "created_at": 1755550281
 }
