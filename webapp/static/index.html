@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat RAG — Entrevistas</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Chat RAG — Entrevistas</h1>
+      <div id="status"></div>
+    </header>
+
+    <section class="controls">
+      <label>
+        Persona:
+        <select id="person">
+          <option value="">(todas)</option>
+        </select>
+      </label>
+      <label>
+        k: <input id="k" type="number" min="1" max="32" value="12">
+      </label>
+      <label>
+        ventana (s): <input id="window" type="number" min="0" max="60" value="10">
+      </label>
+      <label>
+        top ≥ <input id="topt" type="number" step="0.01" min="0" max="1" value="0.30">
+      </label>
+      <label>
+        mean ≥ <input id="tmean" type="number" step="0.01" min="0" max="1" value="0.28">
+      </label>
+      <label>
+        <input id="sources" type="checkbox"> mostrar fuentes
+      </label>
+    </section>
+
+    <section id="chat">
+      <div class="msg sys">Escribe tu pregunta. Si el conocimiento no está en el corpus, responderé: “No sé”.</div>
+    </section>
+
+    <form id="form">
+      <input id="q" type="text" placeholder="Escribe tu pregunta…" autocomplete="off" required />
+      <button type="submit">Enviar</button>
+    </form>
+  </div>
+
+<script>
+async function health() {
+  try {
+    const r = await fetch('/health');
+    const j = await r.json();
+    const s = document.getElementById('status');
+    s.textContent = `index: ${j.index} | model: ${j.model}`;
+  } catch (e) {
+    document.getElementById('status').textContent = 'offline';
+  }
+}
+
+async function loadPersons() {
+  try {
+    const r = await fetch('/api/persons');
+    const j = await r.json();
+    const sel = document.getElementById('person');
+    (j.persons || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      sel.appendChild(opt);
+    });
+  } catch (e) {}
+}
+
+function addMsg(role, text) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addSources(sources) {
+  if (!sources || !sources.length) return;
+  const chat = document.getElementById('chat');
+  const box = document.createElement('div');
+  box.className = 'sources';
+  const title = document.createElement('div');
+  title.className = 'src-title';
+  title.textContent = 'Fuentes:';
+  box.appendChild(title);
+  sources.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'src-item';
+    const t0 = toHHMMSS(s.start), t1 = toHHMMSS(s.end);
+    item.textContent = `- ${s.folder}/${s.video_name} ${t0}-${t1} [${s.speaker || 'DESCONOCIDO'}]`;
+    box.appendChild(item);
+  });
+  chat.appendChild(box);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function toHHMMSS(x) {
+  x = Math.max(0, Math.floor(x));
+  const h = String(Math.floor(x/3600)).padStart(2,'0');
+  const m = String(Math.floor((x%3600)/60)).padStart(2,'0');
+  const s = String(x%60).padStart(2,'0');
+  return `${h}:${m}:${s}`;
+}
+
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const q = document.getElementById('q').value.trim();
+  if (!q) return;
+  addMsg('user', q);
+  document.getElementById('q').value = '';
+
+  const payload = {
+    question: q,
+    person: document.getElementById('person').value || null,
+    k: parseInt(document.getElementById('k').value) || 12,
+    threshold_top: parseFloat(document.getElementById('topt').value) || 0.30,
+    threshold_mean: parseFloat(document.getElementById('tmean').value) || 0.28,
+    window_s: parseFloat(document.getElementById('window').value) || 10,
+    show_sources: document.getElementById('sources').checked
+  };
+
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await r.json();
+    addMsg('bot', j.answer || 'No sé');
+    if (payload.show_sources) addSources(j.sources);
+  } catch (e) {
+    addMsg('bot', 'No sé');
+  }
+});
+
+health();
+loadPersons();
+</script>
+</body>
+</html>
+
